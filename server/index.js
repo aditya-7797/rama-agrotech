@@ -1,4 +1,7 @@
 import 'dotenv/config'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import bcrypt from 'bcryptjs'
 import cookieParser from 'cookie-parser'
 import cors from 'cors'
@@ -6,12 +9,24 @@ import express from 'express'
 import jwt from 'jsonwebtoken'
 import mongoose from 'mongoose'
 
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const distPath = path.resolve(__dirname, '../dist')
+
 const app = express()
 const port = process.env.PORT || 4000
 const clientOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173'
 let databaseStatus = 'not-configured'
 
-app.use(cors({ origin: clientOrigin, credentials: true }))
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || origin === clientOrigin || origin.startsWith('http://localhost:') || process.env.NODE_ENV === 'production') {
+      return callback(null, true)
+    }
+    return callback(null, true)
+  },
+  credentials: true
+}))
 app.use(express.json({ limit: '1mb' }))
 app.use(cookieParser())
 
@@ -132,6 +147,14 @@ app.delete('/api/sales/:id', auth, async (req, res) => { const session = await m
 app.post('/api/sales', auth, async (req, res) => { const session = await mongoose.startSession(); try { let sale; await session.withTransaction(async () => { if (!Array.isArray(req.body.items) || req.body.items.length === 0) throw new Error('At least one sale item is required'); const items = []; const reserved = new Map(); for (const input of req.body.items) { const product = await Product.findOne({ _id: input.product, isActive: true }).session(session); const quantity = Number(input.quantity); const sellingPrice = input.sellingPrice === undefined || input.sellingPrice === '' ? product?.sellingPrice : Number(input.sellingPrice); const already = reserved.get(String(input.product)) || 0; if (!product || !Number.isInteger(quantity) || quantity <= 0 || !Number.isFinite(sellingPrice) || sellingPrice < 0) throw new Error('Each sale item must have a valid product, quantity, and rate'); if (product.stockQuantity < quantity + already) throw new Error(`Insufficient stock for ${product.name}`); reserved.set(String(product._id), already + quantity); items.push({ product: product._id, productNameSnapshot: product.name, skuSnapshot: product.sku, quantity, sellingPrice, costPriceSnapshot: product.weightedAverageCost, lineTotal: money(quantity * sellingPrice) }) } const totalAmount = money(items.reduce((sum, item) => sum + item.lineTotal, 0)); const amountPaid = money(Number(req.body.amountPaid || 0)); const balanceDue = requireCreditDetails(totalAmount, amountPaid, req.body.customerName, req.body.dueDate); const paymentStatus = balanceDue === 0 ? 'PAID' : amountPaid > 0 ? 'PARTIAL' : 'UDHARI'; sale = (await Sale.create([{ invoiceId: await nextId(Sale, 'invoiceId', 'INV'), saleDate: req.body.saleDate || new Date(), customerName: req.body.customerName, customerPhone: req.body.customerPhone, items, totalAmount, amountPaid, balanceDue, paymentStatus, dueDate: req.body.dueDate, notes: req.body.notes }], { session }))[0]; for (const item of items) await moveStock({ session, productId: item.product, delta: -item.quantity, movementType: 'SALE_OUT', referenceType: 'SALE', referenceId: sale._id, userId: req.user.id }); if (amountPaid > 0) await Payment.create([{ sale: sale._id, amount: amountPaid, paymentMethod: req.body.paymentMethod || 'OTHER' }], { session }) }); res.status(201).json(sale) } catch (error) { res.status(400).json({ message: error.message }) } finally { await session.endSession() } })
 app.post('/api/sales/:id/payments', auth, async (req, res) => { const session = await mongoose.startSession(); try { let sale; await session.withTransaction(async () => { sale = await Sale.findOne({ _id: req.params.id, status: 'COMPLETED' }).session(session); if (!sale || sale.balanceDue <= 0) throw new Error('Invoice has no outstanding balance'); const amount = money(req.body.amount); if (!amount || amount > sale.balanceDue) throw new Error('Payment must be greater than zero and cannot exceed the balance'); await Payment.create([{ sale: sale._id, amount, paymentDate: req.body.paymentDate || new Date(), paymentMethod: req.body.paymentMethod || 'OTHER', notes: req.body.notes }], { session }); sale.amountPaid = money(sale.amountPaid + amount); sale.balanceDue = money(sale.totalAmount - sale.amountPaid); sale.paymentStatus = sale.balanceDue === 0 ? 'PAID' : 'PARTIAL'; await sale.save({ session }) }); res.json(sale) } catch (error) { res.status(400).json({ message: error.message }) } finally { await session.endSession() } })
 app.get('/api/dashboard', auth, async (req, res) => { const [products, sales, outstanding, profitByProduct, profitByMonth] = await Promise.all([Product.find({ isActive: true }).lean(), Sale.find({ status: 'COMPLETED' }).sort({ saleDate: -1 }).limit(5).lean(), Sale.aggregate([{ $match: { status: 'COMPLETED', balanceDue: { $gt: 0 } } }, { $group: { _id: null, total: { $sum: '$balanceDue' }, count: { $sum: 1 } } }]), Sale.aggregate([{ $match: { status: 'COMPLETED' } }, { $unwind: '$items' }, { $group: { _id: '$items.productNameSnapshot', revenue: { $sum: '$items.lineTotal' }, cogs: { $sum: { $multiply: ['$items.quantity', '$items.costPriceSnapshot'] } } } }, { $project: { _id: 0, product: '$_id', revenue: 1, profit: { $subtract: ['$revenue', '$cogs'] } } }, { $sort: { profit: -1 } }]), Sale.aggregate([{ $match: { status: 'COMPLETED' } }, { $unwind: '$items' }, { $group: { _id: { $dateToString: { format: '%Y-%m', date: '$saleDate', timezone: 'Asia/Kolkata' } }, revenue: { $sum: '$items.lineTotal' }, cogs: { $sum: { $multiply: ['$items.quantity', '$items.costPriceSnapshot'] } } } }, { $project: { _id: 0, month: '$_id', revenue: 1, profit: { $subtract: ['$revenue', '$cogs'] } } }, { $sort: { month: 1 } }])]); res.json({ products, recentSales: sales, outstanding: outstanding[0] || { total: 0, count: 0 }, profitByProduct, profitByMonth }) })
+
+if (fs.existsSync(distPath)) {
+  app.use(express.static(distPath))
+  app.use((req, res, next) => {
+    if (req.method !== 'GET' || req.path.startsWith('/api')) return next()
+    res.sendFile(path.join(distPath, 'index.html'))
+  })
+}
 
 app.use((error, req, res, _next) => { if (error?.code === 11000) return res.status(409).json({ message: 'A record with that identifier already exists' }); res.status(500).json({ message: 'Unexpected server error' }) })
 

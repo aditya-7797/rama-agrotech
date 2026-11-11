@@ -9,7 +9,11 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "server": "node server/index.js",
+    "start": "node server/index.js",
     "seed:admin": "node server/seed-admin.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
